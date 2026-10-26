@@ -1,0 +1,798 @@
+import type { Hooks } from "@synsci/plugin"
+import { Log } from "../util/log"
+import { escapeHtml, htmlResponse } from "../util/html"
+import { Installation } from "../installation"
+import { Auth, OAUTH_DUMMY_KEY } from "../auth"
+import os from "os"
+
+const log = Log.create({ service: "plugin.codex" })
+
+const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+const ISSUER = "https://auth.openai.com"
+const CODEX_API_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
+const OAUTH_PORT = 1455
+const OAUTH_POLLING_SAFETY_MARGIN_MS = 3000
+// Refresh a bit BEFORE expiry so a request never races the token going stale.
+const REFRESH_MARGIN_MS = 60_000
+// Cap the device-code poll loop so a never-approved authorization can't hang forever.
+const DEVICE_TIMEOUT_MS = 10 * 60 * 1000
+// Bound the OAuth token HTTP calls so a hung auth.openai.com never wedges login.
+const OAUTH_HTTP_TIMEOUT_MS = 20_000
+
+/** Thrown when a refresh is rejected with a 4xx — the refresh token itself is
+ *  invalid (revoked or rotated away), so the user must reconnect. Distinct from a
+ *  transient 5xx/network failure, which we retry and never surface as "expired". */
+export class CodexRefreshInvalidError extends Error {}
+
+/**
+ * How the device-code poll loop should treat a non-OK poll response:
+ *   - "pending"   : the user hasn't approved yet (403/404) — keep polling.
+ *   - "transient" : a rate-limit (429) or upstream blip (5xx) — keep polling
+ *                   (the caller backs off on 429).
+ *   - "fail"      : a genuine terminal failure (denied, expired, bad request)
+ *                   — stop polling and surface a clean failure.
+ * Previously the loop failed on ANY status other than 403/404, so a single
+ * transient 429/5xx aborted the whole sign-in.
+ */
+export function classifyDevicePollStatus(status: number): "pending" | "transient" | "fail" {
+  if (status === 403 || status === 404) return "pending"
+  if (status === 429 || status >= 500) return "transient"
+  return "fail"
+}
+
+/**
+ * Send a Codex request and, on a 401, refresh the access token once and retry
+ * once. The loader's proactive refresh only catches token EXPIRY; a token
+ * revoked/invalidated server-side before its local `expires` (password change,
+ * admin revoke, clock skew) surfaces as a 401 that was otherwise returned
+ * verbatim — the request just failed. `refresh` returns the new access token,
+ * `undefined` to give up (the original 401 is returned unchanged), or throws to
+ * surface a fatal error (e.g. the refresh token itself is dead). Retries at most
+ * once, so it can never loop.
+ */
+export async function sendWithCodex401Retry(
+  send: (accessToken: string) => Promise<Response>,
+  accessToken: string,
+  refresh: () => Promise<string | undefined>,
+): Promise<Response> {
+  const response = await send(accessToken)
+  if (response.status !== 401) return response
+  const refreshed = await refresh()
+  if (!refreshed) return response
+  return send(refreshed)
+}
+
+interface PkceCodes {
+  verifier: string
+  challenge: string
+}
+
+async function generatePKCE(): Promise<PkceCodes> {
+  const verifier = generateRandomString(43)
+  const encoder = new TextEncoder()
+  const data = encoder.encode(verifier)
+  const hash = await crypto.subtle.digest("SHA-256", data)
+  const challenge = base64UrlEncode(hash)
+  return { verifier, challenge }
+}
+
+function generateRandomString(length: number): string {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+  // Rejection sampling for a uniform distribution. `b % 66` over bytes 0-255
+  // biased toward the first 58 characters (256 mod 66 = 58); drop bytes in the
+  // non-uniform tail so every character is equally likely. (All chars are
+  // unreserved per RFC 3986, so the verifier stays URL-safe.)
+  const max = 256 - (256 % chars.length)
+  const out: string[] = []
+  while (out.length < length) {
+    for (const b of crypto.getRandomValues(new Uint8Array(length - out.length))) {
+      if (b < max) out.push(chars[b % chars.length])
+    }
+  }
+  return out.join("")
+}
+
+function base64UrlEncode(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer)
+  const binary = String.fromCharCode(...bytes)
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
+}
+
+function generateState(): string {
+  return base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)).buffer)
+}
+
+export interface IdTokenClaims {
+  chatgpt_account_id?: string
+  organizations?: Array<{ id: string }>
+  email?: string
+  "https://api.openai.com/auth"?: {
+    chatgpt_account_id?: string
+  }
+}
+
+export function parseJwtClaims(token: string): IdTokenClaims | undefined {
+  const parts = token.split(".")
+  if (parts.length !== 3) return undefined
+  try {
+    return JSON.parse(Buffer.from(parts[1], "base64url").toString())
+  } catch {
+    return undefined
+  }
+}
+
+export function extractAccountIdFromClaims(claims: IdTokenClaims): string | undefined {
+  return (
+    claims.chatgpt_account_id ||
+    claims["https://api.openai.com/auth"]?.chatgpt_account_id ||
+    claims.organizations?.[0]?.id
+  )
+}
+
+export function extractAccountId(tokens: TokenResponse): string | undefined {
+  if (tokens.id_token) {
+    const claims = parseJwtClaims(tokens.id_token)
+    const accountId = claims && extractAccountIdFromClaims(claims)
+    if (accountId) return accountId
+  }
+  if (tokens.access_token) {
+    const claims = parseJwtClaims(tokens.access_token)
+    return claims ? extractAccountIdFromClaims(claims) : undefined
+  }
+  return undefined
+}
+
+function buildAuthorizeUrl(redirectUri: string, pkce: PkceCodes, state: string): string {
+  const params = new URLSearchParams({
+    response_type: "code",
+    client_id: CLIENT_ID,
+    redirect_uri: redirectUri,
+    scope: "openid profile email offline_access",
+    code_challenge: pkce.challenge,
+    code_challenge_method: "S256",
+    id_token_add_organizations: "true",
+    codex_cli_simplified_flow: "true",
+    state,
+    originator: "synsci",
+  })
+  return `${ISSUER}/oauth/authorize?${params.toString()}`
+}
+
+interface TokenResponse {
+  id_token: string
+  access_token: string
+  refresh_token: string
+  expires_in?: number
+}
+
+async function exchangeCodeForTokens(code: string, redirectUri: string, pkce: PkceCodes): Promise<TokenResponse> {
+  const response = await fetch(`${ISSUER}/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: redirectUri,
+      client_id: CLIENT_ID,
+      code_verifier: pkce.verifier,
+    }).toString(),
+    signal: AbortSignal.timeout(OAUTH_HTTP_TIMEOUT_MS),
+  })
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "")
+    throw new Error(`Token exchange failed (HTTP ${response.status})${detail ? `: ${detail.slice(0, 200)}` : ""}`)
+  }
+  return response.json()
+}
+
+export async function refreshAccessToken(refreshToken: string): Promise<TokenResponse> {
+  let lastError: Error | undefined
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let response: Response
+    try {
+      response = await fetch(`${ISSUER}/oauth/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: refreshToken,
+          client_id: CLIENT_ID,
+        }).toString(),
+        signal: AbortSignal.timeout(OAUTH_HTTP_TIMEOUT_MS),
+      })
+    } catch (e) {
+      // Network/timeout — transient. Back off and retry.
+      lastError = e instanceof Error ? e : new Error(String(e))
+      await Bun.sleep(500 * (attempt + 1))
+      continue
+    }
+    if (response.ok) return response.json()
+    // A genuine 4xx means the refresh token is bad (revoked/rotated) — retrying
+    // won't help and the user must reconnect. EXCEPT 429/408, which are
+    // rate-limit / timeout, i.e. transient: during a retry storm against an
+    // exhausted usage limit, auth.openai.com rate-limits the token endpoint, and
+    // treating that as "sign-in expired" forced a needless full re-auth. 5xx is
+    // transient too — retry all of these with backoff.
+    if (response.status >= 400 && response.status < 500 && response.status !== 429 && response.status !== 408) {
+      throw new CodexRefreshInvalidError(`Token refresh rejected (HTTP ${response.status})`)
+    }
+    lastError = new Error(`Token refresh failed: HTTP ${response.status}`)
+    await Bun.sleep(500 * (attempt + 1))
+  }
+  throw lastError ?? new Error("Token refresh failed")
+}
+
+const HTML_SUCCESS = `<!doctype html>
+<html>
+  <head>
+    <title>OpenScience - Codex Authorization Successful</title>
+    <style>
+      body {
+        font-family:
+          system-ui,
+          -apple-system,
+          sans-serif;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        margin: 0;
+        background: #131010;
+        color: #f1ecec;
+      }
+      .container {
+        text-align: center;
+        padding: 2rem;
+      }
+      h1 {
+        color: #f1ecec;
+        margin-bottom: 1rem;
+      }
+      p {
+        color: #b7b1b1;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Authorization Successful</h1>
+      <p>You can close this window and return to OpenScience.</p>
+    </div>
+  </body>
+</html>`
+
+const HTML_ERROR = (error: string) => `<!doctype html>
+<html>
+  <head>
+    <title>OpenScience - Codex Authorization Failed</title>
+    <style>
+      body {
+        font-family:
+          system-ui,
+          -apple-system,
+          sans-serif;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        margin: 0;
+        background: #131010;
+        color: #f1ecec;
+      }
+      .container {
+        text-align: center;
+        padding: 2rem;
+      }
+      h1 {
+        color: #fc533a;
+        margin-bottom: 1rem;
+      }
+      p {
+        color: #b7b1b1;
+      }
+      .error {
+        color: #ff917b;
+        font-family: monospace;
+        margin-top: 1rem;
+        padding: 1rem;
+        background: #3c140d;
+        border-radius: 0.5rem;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Authorization Failed</h1>
+      <p>An error occurred during authorization.</p>
+      <div class="error">${escapeHtml(error)}</div>
+    </div>
+  </body>
+</html>`
+
+interface PendingOAuth {
+  pkce: PkceCodes
+  state: string
+  resolve: (tokens: TokenResponse) => void
+  reject: (error: Error) => void
+}
+
+let oauthServer: ReturnType<typeof Bun.serve> | undefined
+let pendingOAuth: PendingOAuth | undefined
+
+// Include persistence in the shared flight, and key it by the refresh token:
+// a newly connected account must never join the previous account's request.
+const refreshInflight = new Map<string, Promise<Auth.Oauth>>()
+
+export class CodexCredentialsChangedError extends Error {
+  constructor() {
+    super("Codex connection changed while refreshing. Retry with the current connection.")
+  }
+}
+
+export async function refreshCodexAuth(previous: Auth.Oauth): Promise<Auth.Oauth> {
+  const pending = refreshInflight.get(previous.refresh)
+  if (pending) return pending
+  const read = async () => {
+    const current = await Auth.get("openai-codex")
+    if (
+      current?.type !== "oauth" ||
+      (previous.accountId !== undefined && current.accountId !== previous.accountId) ||
+      current.enterpriseUrl !== previous.enterpriseUrl
+    )
+      throw new CodexCredentialsChangedError()
+    return current
+  }
+  const task = (async () => {
+    const current = await read()
+    if (current.access && current.access !== previous.access && current.expires > Date.now()) return current
+    const tokens = await refreshAccessToken(current.refresh).catch(async (error: unknown) => {
+      // Another process may have spent the rotating token and saved its pair.
+      const latest = await read()
+      if (latest.refresh !== current.refresh && latest.access && latest.expires > Date.now()) return latest
+      throw error
+    })
+    if ("type" in tokens) return tokens
+    const next: Auth.Oauth = {
+      ...current,
+      refresh: tokens.refresh_token,
+      access: tokens.access_token,
+      expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+      accountId: extractAccountId(tokens) || current.accountId,
+    }
+    if (await Auth.renew("openai-codex", current, next)) return next
+    // A late response cannot undo logout, account replacement, or a newer pair.
+    const latest = await read()
+    if (latest.access && latest.expires > Date.now()) return latest
+    throw new CodexCredentialsChangedError()
+  })().finally(() => refreshInflight.delete(previous.refresh))
+  refreshInflight.set(previous.refresh, task)
+  return task
+}
+
+async function startOAuthServer(): Promise<{ port: number; redirectUri: string }> {
+  if (oauthServer) {
+    return { port: OAUTH_PORT, redirectUri: `http://localhost:${OAUTH_PORT}/auth/callback` }
+  }
+
+  oauthServer = Bun.serve({
+    port: OAUTH_PORT,
+    hostname: "127.0.0.1",
+    fetch(req) {
+      const url = new URL(req.url)
+
+      if (url.pathname === "/auth/callback") {
+        const code = url.searchParams.get("code")
+        const state = url.searchParams.get("state")
+        const error = url.searchParams.get("error")
+        const errorDescription = url.searchParams.get("error_description")
+
+        if (error) {
+          const errorMsg = errorDescription || error
+          pendingOAuth?.reject(new Error(errorMsg))
+          pendingOAuth = undefined
+          return htmlResponse(HTML_ERROR(errorMsg))
+        }
+
+        if (!code) {
+          const errorMsg = "Missing authorization code"
+          pendingOAuth?.reject(new Error(errorMsg))
+          pendingOAuth = undefined
+          return htmlResponse(HTML_ERROR(errorMsg), {
+            status: 400,
+          })
+        }
+
+        if (!pendingOAuth || state !== pendingOAuth.state) {
+          const errorMsg = "Invalid state - potential CSRF attack"
+          pendingOAuth?.reject(new Error(errorMsg))
+          pendingOAuth = undefined
+          return htmlResponse(HTML_ERROR(errorMsg), {
+            status: 400,
+          })
+        }
+
+        const current = pendingOAuth
+        pendingOAuth = undefined
+
+        exchangeCodeForTokens(code, `http://localhost:${OAUTH_PORT}/auth/callback`, current.pkce)
+          .then((tokens) => current.resolve(tokens))
+          .catch((err) => current.reject(err))
+
+        return htmlResponse(HTML_SUCCESS)
+      }
+
+      if (url.pathname === "/cancel") {
+        pendingOAuth?.reject(new Error("Login cancelled"))
+        pendingOAuth = undefined
+        return new Response("Login cancelled", { status: 200 })
+      }
+
+      return new Response("Not found", { status: 404 })
+    },
+  })
+
+  log.info("codex oauth server started", { port: OAUTH_PORT })
+  return { port: OAUTH_PORT, redirectUri: `http://localhost:${OAUTH_PORT}/auth/callback` }
+}
+
+function stopOAuthServer() {
+  if (oauthServer) {
+    oauthServer.stop()
+    oauthServer = undefined
+    log.info("codex oauth server stopped")
+  }
+}
+
+export function waitForOAuthCallback(
+  pkce: PkceCodes,
+  state: string,
+  timeoutMs = 5 * 60 * 1000,
+): Promise<TokenResponse> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      // An abandoned attempt must not clear the callback slot owned by a retry.
+      if (pendingOAuth === attempt) pendingOAuth = undefined
+      reject(new Error("OAuth callback timeout - authorization took too long"))
+    }, timeoutMs) // 5 minutes by default
+
+    const attempt: NonNullable<typeof pendingOAuth> = {
+      pkce,
+      state,
+      resolve: (tokens) => {
+        clearTimeout(timeout)
+        resolve(tokens)
+      },
+      reject: (error) => {
+        clearTimeout(timeout)
+        reject(error)
+      },
+    }
+    pendingOAuth = attempt
+  })
+}
+
+export async function CodexAuthPlugin(): Promise<Hooks> {
+  return {
+    auth: {
+      provider: "openai-codex",
+      async loader(getAuth, _provider) {
+        const auth = await getAuth()
+        if (auth?.type !== "oauth") return {}
+
+        // Provider models + cost-zeroing are handled at database
+        // synthesis time in provider/provider.ts. By the time the
+        // loader runs, database["openai-codex"] already has the
+        // Curated Codex-routable models with zero cost.
+
+        return {
+          apiKey: OAUTH_DUMMY_KEY,
+          async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
+            // Remove dummy API key authorization header
+            if (init?.headers) {
+              if (init.headers instanceof Headers) {
+                init.headers.delete("authorization")
+                init.headers.delete("Authorization")
+              } else if (Array.isArray(init.headers)) {
+                init.headers = init.headers.filter(([key]) => key.toLowerCase() !== "authorization")
+              } else {
+                delete init.headers["authorization"]
+                delete init.headers["Authorization"]
+              }
+            }
+
+            let currentAuth: Auth.Info = await getAuth()
+            if (currentAuth?.type !== "oauth") throw new CodexCredentialsChangedError()
+
+            // Refresh before expiry without revoking the turn doing the refresh.
+            if (!currentAuth.access || currentAuth.expires < Date.now() + REFRESH_MARGIN_MS) {
+              log.info("refreshing codex access token")
+              try {
+                currentAuth = await refreshCodexAuth(currentAuth)
+              } catch (error) {
+                if (error instanceof CodexCredentialsChangedError) throw error
+                log.warn("codex token refresh failed", { error: String(error) })
+                if (error instanceof CodexRefreshInvalidError)
+                  throw new Error("Codex sign-in expired. Reconnect it with `openscience keys signin`.")
+                throw new Error(
+                  "Codex is temporarily unavailable (couldn't refresh the access token). Please retry in a moment.",
+                )
+              }
+            }
+
+            // Build headers
+            const headers = new Headers()
+            if (init?.headers) {
+              if (init.headers instanceof Headers) {
+                init.headers.forEach((value, key) => headers.set(key, value))
+              } else if (Array.isArray(init.headers)) {
+                for (const [key, value] of init.headers) {
+                  if (value !== undefined) headers.set(key, String(value))
+                }
+              } else {
+                for (const [key, value] of Object.entries(init.headers)) {
+                  if (value !== undefined) headers.set(key, String(value))
+                }
+              }
+            }
+
+            // Set ChatGPT-Account-Id header for organization subscriptions.
+            // (The authorization header is set per-attempt inside `send` below,
+            // so the 401-retry path can swap in a freshly-refreshed token.)
+            if (currentAuth.accountId) {
+              headers.set("ChatGPT-Account-Id", currentAuth.accountId)
+            }
+
+            // Rewrite URL to Codex endpoint
+            const parsed =
+              requestInput instanceof URL
+                ? requestInput
+                : new URL(typeof requestInput === "string" ? requestInput : requestInput.url)
+            const isCodexRoute =
+              parsed.pathname.includes("/v1/responses") || parsed.pathname.includes("/chat/completions")
+            const url = isCodexRoute ? new URL(CODEX_API_ENDPOINT) : parsed
+
+            // The chatgpt.com Codex endpoint accepts a strict subset of the
+            // standard OpenAI Responses API: it requires `instructions` and
+            // `store: false`, and rejects params like `max_output_tokens`.
+            // Normalize the AI-SDK payload before forwarding.
+            let bodyForRequest = init?.body
+            if (isCodexRoute && typeof bodyForRequest === "string") {
+              try {
+                const parsedBody = JSON.parse(bodyForRequest)
+                let mutated = false
+                if (parsedBody.instructions === undefined) {
+                  parsedBody.instructions = ""
+                  mutated = true
+                }
+                if (parsedBody.store === undefined) {
+                  parsedBody.store = false
+                  mutated = true
+                }
+                // chatgpt.com Codex endpoint rejects these as unsupported.
+                for (const k of ["max_output_tokens", "max_tokens", "temperature", "top_p"]) {
+                  if (k in parsedBody) {
+                    delete parsedBody[k]
+                    mutated = true
+                  }
+                }
+                if (mutated) bodyForRequest = JSON.stringify(parsedBody)
+              } catch {
+                // body wasn't JSON — leave it alone
+              }
+            }
+
+            // Send with the current bearer; re-called by the 401-retry path with
+            // a refreshed token. Each attempt re-sets the authorization header.
+            const send = (accessToken: string) => {
+              headers.set("authorization", `Bearer ${accessToken}`)
+              return fetch(url, { ...init, headers, body: bodyForRequest })
+            }
+
+            // Reactive (on-401) refresh: the token was rejected even though it
+            // isn't locally expired. Re-read the latest persisted auth first (a
+            // sibling process may have already rotated the pair) and adopt a
+            // newer token if one exists; otherwise spend the refresh token and
+            // persist the rotated pair. Returns the fresh access token, undefined
+            // to keep the original 401 (transient failure), or throws when the
+            // refresh token itself is dead.
+            const forceRefreshOn401 = async (): Promise<string | undefined> => {
+              try {
+                if (currentAuth.type !== "oauth") throw new CodexCredentialsChangedError()
+                currentAuth = await refreshCodexAuth(currentAuth)
+                if (currentAuth.accountId) headers.set("ChatGPT-Account-Id", currentAuth.accountId)
+                return currentAuth.access
+              } catch (e) {
+                if (e instanceof CodexCredentialsChangedError) throw e
+                if (e instanceof CodexRefreshInvalidError)
+                  throw new Error("Codex sign-in expired. Reconnect it with `openscience keys signin`.")
+                log.warn("codex 401-triggered refresh failed", { error: String(e) })
+                return undefined
+              }
+            }
+
+            // On quota exhaustion, return the 429/403 to the caller as-is. The
+            // previous "fall back to OPENAI_API_KEY against api.openai.com" path
+            // was removed: it forwarded the ChatGPT-internal Codex model id +
+            // Codex-shaped body to the standard OpenAI Responses API (which
+            // doesn't know those models, so it just 400s), and the substring
+            // quota-match ("quota"/"rate_limit"/"capacity") could misfire on
+            // unrelated 403s — silently charging the user's personal OpenAI key.
+            // A clean 429/403 is the correct signal that the subscription is
+            // rate-limited; the user's own `openai` provider (BYOK) is the
+            // supported way to run on an API key.
+            return isCodexRoute
+              ? await sendWithCodex401Retry(send, currentAuth.access, forceRefreshOn401)
+              : await send(currentAuth.access)
+          },
+        }
+      },
+      methods: [
+        {
+          label: "Codex — Sign in with ChatGPT (browser)",
+          type: "oauth",
+          authorize: async () => {
+            let redirectUri: string
+            try {
+              ;({ redirectUri } = await startOAuthServer())
+            } catch (e) {
+              throw new Error(
+                `Couldn't start the browser sign-in listener on port ${OAUTH_PORT} ` +
+                  `(${e instanceof Error ? e.message : String(e)}). Free the port, or run ` +
+                  "`openscience keys signin` and choose the device-code method.",
+              )
+            }
+            const pkce = await generatePKCE()
+            const state = generateState()
+            const authUrl = buildAuthorizeUrl(redirectUri, pkce, state)
+
+            const callbackPromise = waitForOAuthCallback(pkce, state)
+
+            return {
+              url: authUrl,
+              instructions: "Complete authorization in your browser. This window will close automatically.",
+              method: "auto" as const,
+              callback: async () => {
+                // Stop the loopback listener on EVERY terminal outcome (success,
+                // CSRF/denied, or timeout), not just success — otherwise a failed
+                // attempt leaks port 1455 for the life of the process and the next
+                // browser sign-in can't bind it.
+                try {
+                  const tokens = await callbackPromise
+                  const accountId = extractAccountId(tokens)
+
+                  return {
+                    type: "success" as const,
+                    refresh: tokens.refresh_token,
+                    access: tokens.access_token,
+                    expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+                    accountId,
+                  }
+                } finally {
+                  stopOAuthServer()
+                }
+              },
+            }
+          },
+        },
+        {
+          label: "Codex — Sign in with ChatGPT (device code)",
+          type: "oauth",
+          authorize: async () => {
+            const deviceResponse = await fetch(`${ISSUER}/api/accounts/deviceauth/usercode`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "User-Agent": `openscience/${Installation.VERSION}`,
+              },
+              body: JSON.stringify({ client_id: CLIENT_ID }),
+              signal: AbortSignal.timeout(OAUTH_HTTP_TIMEOUT_MS),
+            })
+
+            if (!deviceResponse.ok) throw new Error("Failed to initiate device authorization")
+
+            const deviceData = (await deviceResponse.json()) as {
+              device_auth_id: string
+              user_code: string
+              interval: string
+            }
+            const interval = Math.max(parseInt(deviceData.interval) || 5, 1) * 1000
+
+            return {
+              url: `${ISSUER}/codex/device`,
+              instructions: `Enter code: ${deviceData.user_code}`,
+              method: "auto" as const,
+              async callback() {
+                const deadline = Date.now() + DEVICE_TIMEOUT_MS
+                // Mutable so a rate-limit (429) can back the poll cadence off.
+                let pollInterval = interval
+                while (Date.now() < deadline) {
+                  let response: Response
+                  try {
+                    response = await fetch(`${ISSUER}/api/accounts/deviceauth/token`, {
+                      method: "POST",
+                      headers: {
+                        "Content-Type": "application/json",
+                        "User-Agent": `openscience/${Installation.VERSION}`,
+                      },
+                      body: JSON.stringify({
+                        device_auth_id: deviceData.device_auth_id,
+                        user_code: deviceData.user_code,
+                      }),
+                      signal: AbortSignal.timeout(OAUTH_HTTP_TIMEOUT_MS),
+                    })
+                  } catch {
+                    // A network blip or a single hung poll timing out is transient —
+                    // keep polling until the overall DEVICE_TIMEOUT_MS deadline
+                    // instead of aborting the whole login on one bad socket.
+                    await Bun.sleep(pollInterval + OAUTH_POLLING_SAFETY_MARGIN_MS)
+                    continue
+                  }
+
+                  if (response.ok) {
+                    const data = (await response.json()) as {
+                      authorization_code: string
+                      code_verifier: string
+                    }
+
+                    const tokenResponse = await fetch(`${ISSUER}/oauth/token`, {
+                      method: "POST",
+                      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                      body: new URLSearchParams({
+                        grant_type: "authorization_code",
+                        code: data.authorization_code,
+                        redirect_uri: `${ISSUER}/deviceauth/callback`,
+                        client_id: CLIENT_ID,
+                        code_verifier: data.code_verifier,
+                      }).toString(),
+                      signal: AbortSignal.timeout(OAUTH_HTTP_TIMEOUT_MS),
+                    })
+
+                    if (!tokenResponse.ok) {
+                      throw new Error(`Token exchange failed: ${tokenResponse.status}`)
+                    }
+
+                    const tokens: TokenResponse = await tokenResponse.json()
+                    const accountId = extractAccountId(tokens)
+
+                    return {
+                      type: "success" as const,
+                      refresh: tokens.refresh_token,
+                      access: tokens.access_token,
+                      expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+                      accountId,
+                    }
+                  }
+
+                  // Keep polling while the authorization is pending or a
+                  // transient rate-limit/upstream blip is in flight; only a
+                  // genuine terminal status ends the login.
+                  if (classifyDevicePollStatus(response.status) === "fail") {
+                    return { type: "failed" as const }
+                  }
+                  if (response.status === 429) {
+                    pollInterval = Math.min(pollInterval * 2, 30_000)
+                  }
+
+                  await Bun.sleep(pollInterval + OAUTH_POLLING_SAFETY_MARGIN_MS)
+                }
+                // Deadline hit without approval — surface a clean failure rather
+                // than polling forever.
+                return { type: "failed" as const }
+              },
+            }
+          },
+        },
+        // No API-key method on this slot: the openai-codex provider only
+        // accepts ChatGPT OAuth. BYOK belongs on the separate ``openai``
+        // provider slot.
+      ],
+    },
+    "chat.headers": async (input, output) => {
+      if (input.model.providerID !== "openai-codex") return
+      output.headers.originator = "synsci"
+      output.headers["User-Agent"] =
+        `openscience/${Installation.VERSION} (${os.platform()} ${os.release()}; ${os.arch()})`
+      output.headers.session_id = input.sessionID
+    },
+  }
+}
